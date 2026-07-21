@@ -39,7 +39,7 @@ try:
 			udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 			udp.bind(('0.0.0.0', UDP_PORT))
 
-			file, addr = udp.recvfrom(4096) # recieve file from server
+			file, addr = udp.recvfrom(4096) # receive file from server
 
 			part = msg.split(' ', 1)
 			if (len(part) == 1):

@@ -11,3 +11,11 @@ Những cú pháp có thể thắc mắc:
 
 Ưu điểm khi làm UDP với TCP:
 -Khi gửi file có dung lượng thấp thì nhanh hơn so với TCP và sẽ có mất mát ít hơn
+
+
+Phần chuyển đổi active/passive:
+
+- Tạo 1 class chung cho node với các chức năng (operatingMode.py):
+    + Chuyển đổi protocol TCP/UDP
+    + Chuyển đổi mode active(client) và passive(server)
+- Gọi class Node dưới 2 file serverNode và clientNode để chạy 
