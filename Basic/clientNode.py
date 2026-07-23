@@ -1,14 +1,30 @@
-from operatingMode import Node
 import time
+from Node import Node
 
-TCP_PORT = 1234
-UDP_PORT = 5000
+def main():
+    print("=== CLIENT NODE DEMO ===")
+    
+    client_node = Node(hostID="127.0.0.1", port=9001)
 
+    # ACTIVE TCP DEMO
+    print("\n[+] Testing ACTIVE TCP Mode (Connecting to 127.0.0.1:9000)...")
+    print("[*] You can log in using FTP commands: USER <username>, then PASS <password>")
+    client_node.protocol = "TCP"
+    client_node.switchToActiveMode(otherHostID="127.0.0.1", otherPort=9000)
 
-'''client = Node(hostID = '0.0.0.0', port = 1200, mode = "Active")
-time.sleep(1)
-client.switchToActiveMode(otherHostID = '127.0.0.1', otherPort = 1234, msg = "Hello")'''
+    print("\n[*] TCP Client closed. Wait 5 seconds before switching to UDP test...")
+    time.sleep(5)
 
-client = Node(hostID = '0.0.0.0', port = 1200, mode = "Active", protocol = "UDP")
-time.sleep(1)
-client.switchToActiveMode(otherHostID = '127.0.0.1', otherPort = 5000, msg = "Hello")
+    # ACTIVE UDP DEMO
+    print("\n[+] Testing ACTIVE UDP Mode (Sending packet to 127.0.0.1:9000)...")
+    client_node.protocol = "UDP"
+    client_node.switchToActiveMode(
+        otherHostID="127.0.0.1", 
+        otherPort=9000, 
+        msg="Ping from Active UDP Client Node!"
+    )
+
+    print("\n[=== CLIENT DEMO COMPLETED ===]")
+
+if __name__ == "__main__":
+    main()

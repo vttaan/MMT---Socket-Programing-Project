@@ -15,7 +15,11 @@ Những cú pháp có thể thắc mắc:
 
 Phần chuyển đổi active/passive:
 
-- Tạo 1 class chung cho node với các chức năng (operatingMode.py):
+- Tạo 1 class chung cho node với các chức năng (Node.py):
     + Chuyển đổi protocol TCP/UDP
     + Chuyển đổi mode active(client) và passive(server)
 - Gọi class Node dưới 2 file serverNode và clientNode để chạy 
+- Các file đang dùng: Node.py, FTPCommandHandle.py, serverNode.py, clientNode.py
+- Để chạy node và giao tiếp cơ bản:
+    + Chạy serverNode.py, tạo userName và password, chạy clientNode.py và kết nối tới server
+- Để demo tính năng xử lý multi thread: chạy file MultiThreadDemo.py
