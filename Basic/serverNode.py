@@ -13,11 +13,11 @@ def main():
     tcp_thread = threading.Thread(target=server_node.initPassiveTCP, daemon=True)
     tcp_thread.start()
 
-    print("[*] Passive TCP Server is listening on 127.0.0.1:9000.")
-    print("[*] Run clientNode.py to test TCP connection.")
+    print("\n[*] Passive TCP Server is listening on 127.0.0.1:9000.")
+    print("\n[*] Run clientNode.py to test TCP connection.")
     
     try:
-        time.sleep(25)
+        time.sleep(250)
     except KeyboardInterrupt:
         print("\n[-] Stopping TCP server...")
 

@@ -6,55 +6,124 @@ from FTPCommandHandle import handle_ftp_command
 
 User, password = '', ''
 
-def runningClient(s):
+def runningClient(s,HostId):
     try:
         while True:
-            msg = input("FTP Client> ")
-
-
+            msg = input("FTP Client> ").strip()
+            if not msg:
+                continue 
+            
             command = msg + "\r\n"
-            s.sendall(bytes(command, "utf8"))
-
-            if msg.upper() == "QUIT":
-                reply = s.recv(1024).decode("utf-8").strip()
-                print(f"Server{reply}")
-                break
-                    
+            s.sendall(command.encode("utf8"))
             
             data = s.recv(1024)
-
             if not data:
                 break
+                        
+            str_data = data.decode("utf8").strip()
+            print(f"Server: {str_data}")
+            
+            part = msg.split(' ', 1)
+            cmd = part[0].upper()
+            
+            if cmd == "QUIT":
+                break
 
-            str_data = data.decode("utf8")
-            print("Server:", str_data)
+            #download file from server to client
+            if cmd == "RETR" and str_data.startswith("150"):
+                print("[System] Opening UDP port to receive file...")
+            
+                udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                udp.bind(('0.0.0.0', UDP_PORT))
+            
+                try:
+                    if len(part) == 1:
+                        filename = "download_file.dat"
+                    else:
+                        filename = "downloaded_" + part[1]
 
-            if (msg.upper().startswith("RETR") and str_data.startswith("150")):
-                print("System open to UDP port to recieve files,...")
+                    with open(filename, 'wb') as f:
+                        print(f"System is downloading {filename}...")
+                        while True:
+                            # Nhận từng chunk, tối đa 2048 bytes đề phòng gói tin to hơn 1024 bytes (do byte header)
+                            chunk, address = udp.recvfrom(2048)
 
+                            if chunk == b'__EOF__':
+                                break
+
+                            # Lần lượt ghi các gói tin vào file gốc
+                            f.write(chunk)
+                except Exception as e:
+                    print(f"[System] UDP Error: {e}")
+                finally:
+                    udp.close()
+        
+                    complete_msg = s.recv(1024).decode("utf8").strip()
+                    print(f"Server: {complete_msg}")
+
+
+            #upload file from client to server
+            elif cmd == "STOR" and str_data.startswith("150"):
+                if len(part) > 1:
+                    filename = part[1]
+                    if os.path.exists(filename) and os.path.isfile(filename):
+                        print(f"[System] Opening UDP port to send '{filename}'...")
+                                
+                    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    try:
+                        with open(filename, 'rb') as f:
+                            while True:
+                                # Cắt file thành các khối 1024 bytes (1 chunk)
+                                chunk = f.read(1024)
+                                if not chunk:
+                                    break
+
+                                udp.sendto(chunk, (HostId, UDP_PORT))
+                                time.sleep(0.001) # Nghỉ 0.001s tránh nghẽn mạng
+
+                        # Gửi cờ báo hiệu gửi hoàn tất
+                        udp.sendto(b'__EOF__', (HostId, UDP_PORT))
+                        print(f"[System] File set via UDP!")
+                    except Exception as e:
+                            print(f"[System] UDP Error: {e}")
+                    finally:
+                            udp.close()
+                else:
+                    print(f"[System] Local error: File '{filename}' not found on your machine.")
+                    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    udp.sendto(b'', (HostId, UDP_PORT))
+                    udp.close()
+        
+                    complete_msg = s.recv(1024).decode("utf8").strip()
+                    print(f"Server: {complete_msg}")
+
+
+            # Xử lí lệnh LIST (hiển thị thông tin file/folder) nhận từ UDP
+            elif cmd == "LIST" and str_data.startswith("150"):
+                print("[SYSTEM] Opening UDP port to receive directory list...")
                 udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 udp.bind(('0.0.0.0', UDP_PORT))
 
-                file, addr = udp.recvfrom(4096) # receive file from server
+                try:
+                    print("\n--- DIRECTORY LISTING ---")
+                    while True:
+                        chunk, _ = udp.recvfrom(2048)
 
-                part = msg.split(' ', 1)
-                if (len(part) == 1):
-                    filename = "download_file.txt"
-                else:
-                    filename = part[1] + "_download_file.txt"	
+                        if chunk == b'__EOF__':
+                            break
+                        print(chunk.decode('utf-8'), end = "")
+                    print("-----------")
 
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(file.decode('utf-8'))
-
-                print(f"[System] download file named '{filename}' successfully from {addr}!")
-                udp.close()
-
-                complete_msg = s.recv(1024).decode("utf8").strip()
-                print(f"Server: {complete_msg}")
-
-                
-    except:
-        print("Disconnected")
+                except Exception as e:
+                    print(f"[SYSTEM] UDP Error: {e}")
+                finally:
+                    udp.close()
+                    # Nhận thông báo thành công từ TCP Server
+                    complete_msg = s.recv(1024).decode('utf-8').strip()
+                    print(f"Server: {complete_msg}")
+            
+    except Exception as e:
+                print(f"Disconnected or Error: {e}")
     finally:
         s.close()
 
@@ -95,7 +164,7 @@ TCP_PORT = 1234
 UDP_PORT = 5000
 
 class Node:
-    def __init__(self, hostID = "172.0.0.1", port = TCP_PORT, protocol = "TCP", mode = "Active"):
+    def __init__(self, hostID = "127.0.0.1", port = TCP_PORT, protocol = "TCP", mode = "Active"):
         self.hostID = hostID
         self.port = port
         self.protocol = protocol
@@ -106,15 +175,17 @@ class Node:
     def initPassiveTCP(self):
         self.mode = "Passive"
         self.protocol = "TCP"
-        setUpServer()
+        if not User and not password:
+            setUpServer()
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             self.server.bind((self.hostID, self.port))
         except OSError as e:
             print(f"[-] Failed to bind to {self.hostID}:{self.port} ({e}). Falling back to '127.0.0.1'")
+            self.hostID = '127.0.0.1'
             self.server.bind(('127.0.0.1', self.port))
-        self.server.listen(1)
+        self.server.listen(5)
         self.isRunning = True
         print('------------------------------')
         print(f'Current hostID: {self.hostID}')
@@ -149,7 +220,8 @@ class Node:
     def initPassiveUDP(self):
         self.mode = "Passive"
         self.protocol = "UDP"
-        setUpServer()
+        if not User and not password:
+            setUpServer()
         self.server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind((self.hostID, self.port))
@@ -217,7 +289,7 @@ class Node:
 
                 if pass_resp.startswith("230"):
                     print("[+] Login Verification SUCCESSFUL!")
-                    runningClient(client_socket)
+                    runningClient(client_socket, otherHostID)
                 else:
                     print("[-] Login Verification FAILED! Closing connection.")
                     client_socket.close()
@@ -244,13 +316,13 @@ class Node:
     
     
     def stop(self):
-        self.running = False
+        self.isRunning = False
         if self.server:
             try:
                 self.server.close()
             except:
                 pass
-            self.server = None                
-    
+            self.server = None
+
 if __name__ == "__main__":
-    print('bel')
+    print("bel")
