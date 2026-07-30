@@ -140,7 +140,7 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
 
                     size = str(info.st_size) 
 
-                    mtime = datetime.fromtimestamp(info.st_time).strftime("%b %d %H:%M")
+                    mtime = datetime.fromtimestamp(info.st_mtime).strftime("%b %d %H:%M")
 
                     name = entry.name
 
