@@ -3,9 +3,28 @@ import os
 import hashlib
 import time
 import stat
+import select
 from datetime import datetime
 
 UDP_PORT = 5000
+
+def check_abort(conn):
+    try:
+        #select.selct -> 4 parameters(read,write,error,timeout)
+        rlist, _, _ = select.select([conn], [], [], 0)
+        #check if there is file transfer
+        if rlist:
+            data = conn.recv(1024)
+            if not data:
+                #abort transfer
+                return True
+            msg = data.decode('utf-8', errors='ignore').strip().upper()
+            if "ABOR" in msg:
+                return True
+    except Exception:
+        pass
+    return False
+
 
 def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expected_password):
     # Command used for entering username
@@ -110,40 +129,32 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
             conn.sendall("150 Opening data connection for directory list.\r\n".encode('utf-8'))
 
             list_str = ""
-            target_dir = part[1] if len(part) > 1 else os.getcwd() #os.getcwd(): lấy thư mục hiện tại
+            target_dir = part[1] if len(part) > 1 else os.getcwd() 
 
             if os.path.exists(target_dir) and os.path.isdir(target_dir):
                 for entry in os.scandir(target_dir):
                     info = entry.stat()
 
-                    # Loại file (d: thư mục, -: file thường) và Quyền truy cập
                     file_type = 'd' if entry.is_dir() else '-'
                     perms = stat.filemode(info.st_mode)
 
-                    size = str(info.st_size) # Kích thước (byte) --> string
+                    size = str(info.st_size) 
 
-                    # Thời gian chỉnh sửa lần cuối (Month Day Hour:minute)
                     mtime = datetime.fromtimestamp(info.st_time).strftime("%b %d %H:%M")
 
-                    # Tên file/folder
                     name = entry.name
 
-                    # Ghép lại thành dòng hoàn chỉnh
-                    # perms[1:] bỏ kí tự đầu của chuỗi perms (do đã dùng file_type để tự định nghĩa ký tự đầu)
-                    # {size:>8} căn lề phải sao cho cột dung lượng chiếm đúng 8 khoảng trắng
+
                     list_str += f"{file_type}{perms[1:]} {size:>8} bytes  {mtime}  {name}\r\n"
 
                 if not list_str:
                     list_str = "Directory is empty.\r\n"
 
-                # Gửi dữ liệu bằng UDP
                 udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-                # Chuyển list_str thành bytes và gửi đi
                 udp.sendto(list_str.encode('utf-8'), (addr[0], UDP_PORT))
                 time.sleep(0.001) # Nghỉ chống nghẽn
 
-                # Gửi cờ kết thúc
                 udp.sendto(b"__EOF__", (addr[0], UDP_PORT))
                 udp.close()
 
@@ -244,22 +255,30 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
             else:
                 conn.sendall("150 File status okay, opening data connection\r\n".encode('utf-8'))
                 udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                aborted = False
                 
                 with open(filename, 'rb') as f:
-                    # Cắt nhỏ file: Mỗi lần chỉ đọc 1024 bytes (1 chunk) rồi truyền đi
+                    #check if aborts
                     while True:
+                        if check_abort(conn):
+                            aborted = True
+                            break
+
                         chunk = f.read(1024)
                         if not chunk:
                             break
 
                         udp.sendto(chunk, (addr[0], UDP_PORT))
-                        time.sleep(0.001) # Cho hệ thống nghỉ 0.001s để tránh nghẽn mạng UDP
+                        time.sleep(0.001) 
 
-                # Gửi gói tin đặc biệt báo hiệu đã truyền xong file
-                udp.sendto(b'__EOF__', (addr[0], UDP_PORT))
-
-                udp.close()
-                conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
+                if aborted:
+                    udp.close()
+                    conn.sendall("426 Data connection closed; transfer aborted.\r\n".encode('utf-8'))
+                    conn.sendall("226 ABOR command successful.\r\n".encode('utf-8'))
+                else:
+                    udp.sendto(b'__EOF__', (addr[0], UDP_PORT))
+                    udp.close()
+                    conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
 
     # Command used to upload file from client to server
     elif cmd == "STOR":
@@ -268,21 +287,35 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
             conn.sendall("150 Ok to send data\r\n".encode('utf-8'))
             udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp.bind(('0.0.0.0', UDP_PORT))
+            udp.settimeout(0.5)
 
+            aborted = False
             with open(filename, 'wb') as f:
                 while True:
-                    # Nhận từng gói tin (chunk), 2048 đề phòng gói tin nhận được có kích thước > 1024 bytes (do byte header)
-                    chunk, _ = udp.recvfrom(2048)
-
-                    # Nhận được cờ kết thúc thì dừng lại
-                    if chunk == b'__EOF__':
+                    #check if abort
+                    if check_abort(conn):
+                        aborted = True
                         break
 
-                    # Đọc gói tin (chunk) vào file
-                    f.write(chunk)
+                    try:
+                        chunk, _ = udp.recvfrom(2048)
+
+                        if chunk == b'__EOF__':
+                            break
+
+                        f.write(chunk)
+                    except socket.timeout:
+                        continue
+                    except Exception:
+                        break
 
             udp.close()
-            conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
+
+            if aborted:
+                conn.sendall("426 Data connection closed; transfer aborted.\r\n".encode('utf-8'))
+                conn.sendall("226 ABOR command successful.\r\n".encode('utf-8'))
+            else:
+                conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
         else:
             conn.sendall("500 Syntax error\r\n".encode('utf-8'))
 
@@ -293,12 +326,33 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
         
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp.bind(('0.0.0.0', UDP_PORT))
-        file_bytes, _ = udp.recvfrom(65535)
-        
+        #settimeour
+        udp.settimeout(0.5)
+
+        aborted = False
         with open(unique_filename, 'wb') as f:
-            f.write(file_bytes)
+            while True:
+                #check if abort
+                if check_abort(conn):
+                    aborted = True
+                    break
+                try:
+                    chunk, _ = udp.recvfrom(2048)
+                    if chunk == b'__EOF__':
+                        break
+                    f.write(chunk)
+                    #if timeout
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
         udp.close()
-        conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
+
+        if aborted:
+            conn.sendall("426 Data connection closed; transfer aborted.\r\n".encode('utf-8'))
+            conn.sendall("226 ABOR command successful.\r\n".encode('utf-8'))
+        else:
+            conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
 
     # Command used to append uploaded data to an existing file or create it
     elif cmd == "APPE":
@@ -307,12 +361,30 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
             conn.sendall("150 Ok to send data\r\n".encode('utf-8'))
             udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp.bind(('0.0.0.0', UDP_PORT))
-            file_bytes, _ = udp.recvfrom(65535)
-            
+            udp.settimeout(0.5)
+
+            aborted = False
             with open(filename, 'ab') as f:
-                f.write(file_bytes)
+                while True:
+                    if check_abort(conn):
+                        aborted = True
+                        break
+                    try:
+                        chunk, _ = udp.recvfrom(2048)
+                        if chunk == b'__EOF__':
+                            break
+                        f.write(chunk)
+                    except socket.timeout:
+                        continue
+                    except Exception:
+                        break
             udp.close()
-            conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
+
+            if aborted:
+                conn.sendall("426 Data connection closed; transfer aborted.\r\n".encode('utf-8'))
+                conn.sendall("226 ABOR command successful.\r\n".encode('utf-8'))
+            else:
+                conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
         else:
             conn.sendall("500 Syntax error\r\n".encode('utf-8'))
 
@@ -332,9 +404,9 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
         else:
             conn.sendall("501 Syntax error\r\n".encode('utf-8'))
 
-    # Command used to abort an active transfer/reset state
+    # Command used to abort an active transfer/reset state (when no transfer is active)
     elif cmd == "ABOR":
-        conn.sendall("226 ABOR command successful.\r\n".encode('utf-8'))
+        conn.sendall("226 No transfer in progress.\r\n".encode('utf-8'))
 
     # Command used to list supported commands
     elif cmd == "HELP":
