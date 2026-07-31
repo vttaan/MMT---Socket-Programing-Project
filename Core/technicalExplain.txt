@@ -1,0 +1,88 @@
+================================ GIẢI THÍCH CODE =============================================
+
+[vttaan] serverNode.py
+1. setup server:
+    setUpCredentials(): khởi tạo username, password khi tạo server
+    start():
+        * khởi tạo u/p
+        * tạo socket server = lệnh socket:
+            + AF_INET: addr family + inet *> địa chỉ ipv4 chuẩn
+            + SOCK_STREAM -> định dạng giao thức là TCP
+        - cài đặt option = lệnh setsockopt:
+            + SOL_SOCKET: option level -> mức tiêu chuẩn 
+            + SO_REUSEADDR: cho phép server bind lại vào địa chỉ đã sử dụng
+            + 1: giá trị option
+        - bind địa chỉ id và port (cho phép rebind bằng dòng trên)
+        - lắng nghe kết nối = lệnh listen(5)
+        - khi đang chạy:
+            + settimeout để ping
+            + dùng accept() để nhận kết nối
+            + tạo thread mới = thread.start() để xử lý từng client
+            + parameter daemon dùng để cho phép ngắt thread mặc dù chương trình chưa dừng
+    stop(): dừng server 
+
+2. server thread -> multi thread handling:
+    _client_handler(self, conn, addr):
+        - sử dụng threading.get_ident() để lấy ID của thread hiện tại
+        - conn.recv -> nhận gói tin (1024 là max 1024 byte)
+        - conn.sendall -> gửi gói tin theo giao thức TCP
+
+[vttaan] clientNode.py:
+1. setup client:
+    mặc định giao thức TCP, mode ACTIVE
+    connect():
+        - tạo socket server = lệnh socket:
+            + AF_INET: addr family + inet -> địa chỉ ipv4 chuẩn
+            + SOCK_STREAM -> định dạng giao thức là TCP
+        - kết nối với server xong, lấy thông tin về = lệnh recv (tương tự server)
+    login(): 
+        - dùng 2 command là USER và PASS 
+        - gửi 2 lệnh trên tới server và xác thực
+    interactive_session(): xử lý các lệnh
+        - PASV_MODE: chuyển sang PASIVE:
+        - ACTV_MODE: chuyển sang ACTIVE:
+        - QUIT: ngắt kết nối
+
+
+        - RETR, LIST, STOR -> thiết lập kết nối trước
+            + ACTIVE: 
+                * tạo socket active (như trên)
+                * bind tới id 0.0.0.0, port 0
+                * getsockname trả về id & port, thay dấu . trong ip = , cho chuẩn dạng lệnh PORT
+                * gửi lệnh PORT cho server để tạo đường truyền
+                * recv để nhận phản hồi từ server
+            + PASSIVE: 
+                * gửi lệnh PASV cho server -> server mở port tạm thời -> phản hồi mã 227
+                * recv để nhận phản hồi từ server
+                * fetch lệnh phản hồi bắt đầu bằng mã 227:
+                * tách chuỗi phản hồi lấy id & port
+                * tạo socket mới như trên 
+        - gửi message tới server thông qua client socket
+
+
+        - RETR & phản hồi = 150: (file status ok)
+            + đặt tên file mới
+            + nếu PASSIVE MODE -> dùng socket mới tạo để gửi tin nhắn READY tới ip/port = lệnh sendto (udp)
+            + mở file dưới mode wb (write binary):
+                * settimeout 10 s để đợi
+                * dùng lệnh recvfrom để nhận dữ liệu (max 2048 bytes)
+                * break nếu file rỗng nếu ko thì write vào file
+
+        - STOR & phản hồi = 150:
+            + kiểm tra tồn tại file trong directory của client
+            + ACTIVE MODE:
+                * ip = hostid của client
+                * port = udp port mặc định
+                * nếu trong phản hồi từ server có "port": lấy port từ server chọn 
+            + PASSIVE MODE:
+                * ip = server passive ip lấy từ lệnh PASV
+                * port = port passive ip lấy như trên
+            + mở file dưới mode rb (read binary):
+                * read file, sendto ip/port
+                * send thêm eof
+        - LIST & phản hồi = 150:
+            + nếu PASSIVE MODE -> dùng socket mới tạo để gửi tin nhắn READY tới ip/port = lệnh sendto (udp)
+            + udp socket settimeout 5
+            + lấy phản hồi LIST từ server (max 2048 bytes)
+            
+

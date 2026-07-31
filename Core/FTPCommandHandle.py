@@ -332,7 +332,6 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
     # Command used to delete a file
     elif cmd == "DELE":
         if len(part) > 1:
-                
             phys_path = get_physical_path(part[1], auth_state)
             if os.path.exists(phys_path) and os.path.isfile(phys_path):
                 if file_lock_manager.try_acquire_write(phys_path):
