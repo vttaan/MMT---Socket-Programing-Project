@@ -3,6 +3,7 @@ import os
 import time
 import struct
 import select
+from rdt import rdt_send_file, rdt_receive_file
 
 
 UDP_PORT = 5000
@@ -227,26 +228,17 @@ class ClientNode:
                 try:
                     filename = "download_file.dat" if len(part) == 1 else "downloaded_" + part[1]
                     
-                    if self.data_mode == "PASSIVE":
-                        active_udp_socket.sendto(b"READY", (server_pasv_ip, server_pasv_port))
-                        
-                    print(f"[System] Downloading to '{filename}'...")
-                    with open(filename, 'wb') as f:
-                        active_udp_socket.settimeout(10.0)
-                        while True:
-                            try:
-                                chunk, address = active_udp_socket.recvfrom(2048)
-                                if chunk == b'__EOF__':
-                                    break
-                                f.write(chunk)
-                            except socket.timeout:
-                                print("[System] Download timed out.")
-                                break
-                    print(f"[System] Download complete!")
+                    if active_udp_socket is None:
+                        active_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        active_udp_socket.bind(('0.0.0.0', UDP_PORT))
+
+                    print(f"[System] Opening RDT UDP port to receive '{filename}'...")
+                    rdt_receive_file(active_udp_socket, filename)
                 except Exception as e:
                     print(f"[System] UDP Error: {e}")
                 finally:
-                    active_udp_socket.close()
+                    if active_udp_socket:
+                        active_udp_socket.close()
                     complete_msg = s.recv(1024).decode("utf8").strip()
                     print(f"Server: {complete_msg}")
 
@@ -254,8 +246,7 @@ class ClientNode:
                 if len(part) > 1:
                     filename = part[1]
                     if os.path.exists(filename) and os.path.isfile(filename):
-                        print(f"[System] Uploading '{filename}'...")
-                        
+                        print(f"[System] Opening RDT UDP socket to send '{filename}'...")
                         target_ip = server_pasv_ip if self.data_mode == "PASSIVE" else self.hostID
                         target_port = server_pasv_port if self.data_mode == "PASSIVE" else UDP_PORT
                         
@@ -265,22 +256,19 @@ class ClientNode:
                             except ValueError:
                                 pass
                                 
+                        if active_udp_socket is None:
+                            active_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
                         try:
-                            send_file_sliding_window(
-                                udp_socket=active_udp_socket,
-                                file_path=filename,
-                                target_addr=(target_ip, target_port),
-                                window_size=5,  # Max unACKed packets in flight
-                                timeout=1.0     # Retransmit timeout in seconds
-                            )
-                            print(f"[System] File sent via UDP to {target_ip}:{target_port}!")
+                            rdt_send_file(active_udp_socket, (target_ip, target_port), filename)
+                            print(f"[System] File sent via RDT UDP to {target_ip}:{target_port}!")
                         except Exception as e:
                             print(f"[System] UDP Error: {e}")
                         finally:
                             if active_udp_socket:
                                 active_udp_socket.close()
                     else:
-                        print(f"[System] Local error: File '{filename}' not found.")
+                        print(f"[System] Local error: File '{filename}' not found on your machine.")
                         if active_udp_socket:
                             active_udp_socket.close()
                 
