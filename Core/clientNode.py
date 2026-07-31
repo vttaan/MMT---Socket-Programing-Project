@@ -1,9 +1,63 @@
 import socket
 import os
 import time
+import struct
+import select
+
 
 UDP_PORT = 5000
 
+def send_file_sliding_window(udp_socket, file_path, target_addr, window_size=5, timeout=1.0): 
+    packets = []
+    seq_num = 0
+    with open(file_path, 'rb') as f:
+        while True:
+            chunk = f.read(1024)
+            if not chunk:
+                break
+            header = struct.pack("!I", seq_num)
+            packets.append(header + chunk)
+            seq_num += 1
+    total_packets = len(packets)
+    base = 0
+    next_seq_num = 0
+
+    # Set socket to non-blocking for select-based timeout checks
+    udp_socket.setblocking(False)
+    print(
+        f"[Client] Starting Sliding Window Upload ({total_packets} packets, Window Size={window_size})"
+    )
+
+    while base < total_packets:
+        # A. Fill the window: Send available packets up to (base + window_size)
+        while next_seq_num < base + window_size and next_seq_num < total_packets:
+            udp_socket.sendto(packets[next_seq_num], target_addr)
+            print(f"  [-> Sent] Packet Seq={next_seq_num}")
+            next_seq_num += 1
+        # B. Wait for ACKs using select() with a timeout
+        readable, _, _ = select.select([udp_socket], [], [], timeout)
+        if readable:
+            try:
+                ack_data, _ = udp_socket.recvfrom(1024)
+                if len(ack_data) >= 4:
+                    ack_num = struct.unpack('!I', ack_data[:4])[0]
+                    print(f"  [<- ACK Received] ACK={ack_num}")
+                    # Cumulative ACK handling: Slide window base forward
+                    if ack_num >= base:
+                        base = ack_num + 1
+            except Exception as e:
+                print(f"  [!] ACK read error: {e}")
+        else:
+            # C. Timeout: Retransmit all unACKed packets in current window (Go-Back-N)
+            print(
+                f"  [!] Timeout! Retransmitting window from Seq={base} to {next_seq_num - 1}"
+            )
+            next_seq_num = base  # Reset next_seq_num back to base to resend
+    # 2. Send EOF marker (Special Header Seq = 0xFFFFFFFF)
+    eof_header = struct.pack('!I', 0xFFFFFFFF)
+    udp_socket.sendto(eof_header + b'__EOF__', target_addr)
+    print('[Client] Upload finished successfully with Sliding Window!')
+        
 class ClientNode:
     def __init__(self, hostID="127.0.0.1", port=1234):
         self.hostID = hostID
@@ -212,20 +266,19 @@ class ClientNode:
                                 pass
                                 
                         try:
-                            with open(filename, 'rb') as f:
-                                while True:
-                                    chunk = f.read(1024)
-                                    if not chunk:
-                                        break
-                                    active_udp_socket.sendto(chunk, (target_ip, target_port))
-                                    time.sleep(0.001)
-                            
-                            active_udp_socket.sendto(b'__EOF__', (target_ip, target_port))
+                            send_file_sliding_window(
+                                udp_socket=active_udp_socket,
+                                file_path=filename,
+                                target_addr=(target_ip, target_port),
+                                window_size=5,  # Max unACKed packets in flight
+                                timeout=1.0     # Retransmit timeout in seconds
+                            )
                             print(f"[System] File sent via UDP to {target_ip}:{target_port}!")
                         except Exception as e:
                             print(f"[System] UDP Error: {e}")
                         finally:
-                            active_udp_socket.close()
+                            if active_udp_socket:
+                                active_udp_socket.close()
                     else:
                         print(f"[System] Local error: File '{filename}' not found.")
                         if active_udp_socket:
@@ -257,6 +310,7 @@ class ClientNode:
                     active_udp_socket.close()
                     complete_msg = s.recv(1024).decode('utf-8').strip()
                     print(f"Server: {complete_msg}")
+    
 
 if __name__ == "__main__":
     print("==========================================================")

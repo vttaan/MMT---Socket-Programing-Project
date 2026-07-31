@@ -6,6 +6,7 @@ import stat
 import select
 import threading
 from datetime import datetime
+import struct
 
 UDP_PORT = 5000
 
@@ -227,11 +228,6 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
     # Command used to list files in directory
     elif cmd == "LIST":
         try:
-            conn.sendall("150 Opening data connection for directory list.\r\n".encode('utf-8'))
-
-            list_str = ""
-            target_dir = part[1] if len(part) > 1 else os.getcwd() 
-
             target_dir = get_physical_path(part[1] if len(part) > 1 else "", auth_state)
             if os.path.exists(target_dir) and os.path.isdir(target_dir):
                 conn.sendall("150 Opening data connection for directory list.\r\n".encode('utf-8'))
@@ -239,32 +235,19 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
                 list_str = ""
                 for entry in os.scandir(target_dir):
                     info = entry.stat()
-
                     file_type = 'd' if entry.is_dir() else '-'
                     perms = stat.filemode(info.st_mode)
-
-                    size = str(info.st_size) 
-
-                    mtime = datetime.fromtimestamp(info.st_mtime).strftime("%b %d %H:%M")
-
                     size = str(info.st_size)
-                    mtime = datetime.fromtimestamp(info.st_time).strftime("%b %d %H:%M")
+                    mtime = datetime.fromtimestamp(info.st_mtime).strftime("%b %d %H:%M")
                     name = entry.name
-
-
                     list_str += f"{file_type}{perms[1:]} {size:>8} bytes  {mtime}  {name}\r\n"
 
                 if not list_str:
                     list_str = "Directory is empty.\r\n"
 
-                # Send data via UDP
-                udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-                udp.sendto(list_str.encode('utf-8'), (addr[0], UDP_PORT))
-                time.sleep(0.001) # Nghỉ chống nghẽn
-
-                udp.sendto(b"__EOF__", (addr[0], UDP_PORT))
+                # Send data via UDP to configured data_addr
                 data_addr = auth_state.get('data_addr', (addr[0], UDP_PORT))
+                udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 
                 print(f"[SERVER Thread-{current_thread}] Sending directory list to UDP address {data_addr}")
                 udp.sendto(list_str.encode('utf-8'), data_addr)
@@ -398,32 +381,6 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
             if not os.path.exists(phys_path) or not os.path.isfile(phys_path):
                 conn.sendall("550 File unavailable\r\n".encode('utf-8'))
             else:
-                conn.sendall("150 File status okay, opening data connection\r\n".encode('utf-8'))
-                udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                aborted = False
-                
-                with open(filename, 'rb') as f:
-                    #check if aborts
-                    while True:
-                        if check_abort(conn):
-                            aborted = True
-                            break
-
-                        chunk = f.read(1024)
-                        if not chunk:
-                            break
-
-                        udp.sendto(chunk, (addr[0], UDP_PORT))
-                        time.sleep(0.001) 
-
-                if aborted:
-                    udp.close()
-                    conn.sendall("426 Data connection closed; transfer aborted.\r\n".encode('utf-8'))
-                    conn.sendall("226 ABOR command successful.\r\n".encode('utf-8'))
-                else:
-                    udp.sendto(b'__EOF__', (addr[0], UDP_PORT))
-                    udp.close()
-                    conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
                 if file_lock_manager.try_acquire_read(phys_path):
                     try:
                         conn.sendall("150 File status okay, opening data connection\r\n".encode('utf-8'))
@@ -455,38 +412,6 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
     elif cmd == "STOR":
         if len(part) > 1:
             filename = part[1]
-            conn.sendall("150 Ok to send data\r\n".encode('utf-8'))
-            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp.bind(('0.0.0.0', UDP_PORT))
-            udp.settimeout(0.5)
-
-            aborted = False
-            with open(filename, 'wb') as f:
-                while True:
-                    #check if abort
-                    if check_abort(conn):
-                        aborted = True
-                        break
-
-                    try:
-                        chunk, _ = udp.recvfrom(2048)
-
-                        if chunk == b'__EOF__':
-                            break
-
-                        f.write(chunk)
-                    except socket.timeout:
-                        continue
-                    except Exception:
-                        break
-
-            udp.close()
-
-            if aborted:
-                conn.sendall("426 Data connection closed; transfer aborted.\r\n".encode('utf-8'))
-                conn.sendall("226 ABOR command successful.\r\n".encode('utf-8'))
-            else:
-                conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
             phys_path = get_physical_path(filename, auth_state)
             if file_lock_manager.try_acquire_write(phys_path):
                 udp = None
@@ -500,11 +425,36 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
                     print(f"[SERVER Thread-{current_thread}] Listening for file upload on dynamic UDP port {server_port}")
                     
                     with open(phys_path, 'wb') as f:
+                        expected_seq = 0
+    
                         while True:
-                            chunk, _ = udp.recvfrom(2048)
-                            if chunk == b'__EOF__':
+                            try:
+                                packet, client_addr = udp.recvfrom(2048)
+                                
+                                # 1. Check for EOF packet (Header = 0xFFFFFFFF)
+                                if len(packet) >= 4:
+                                    seq_num = struct.unpack('!I', packet[:4])[0]
+                                    payload = packet[4:]
+                                    if seq_num == 0xFFFFFFFF and payload == b'__EOF__':
+                                        print(f"[SERVER Thread-{current_thread}] Received EOF. Upload completed.")
+                                        break
+                                    
+                                    # 2. In-order packet check
+                                    if seq_num == expected_seq:
+                                        f.write(payload)
+                                        # Send ACK back for this sequence number
+                                        ack_packet = struct.pack('!I', seq_num)
+                                        udp.sendto(ack_packet, client_addr)
+                                        expected_seq += 1
+                                    else:
+                                        # Duplicate or out-of-order packet: Re-ACK the last valid packet
+                                        if expected_seq > 0:
+                                            ack_packet = struct.pack('!I', expected_seq - 1)
+                                            udp.sendto(ack_packet, client_addr)
+                                            
+                            except socket.timeout:
+                                print(f"[SERVER Thread-{current_thread}] Socket timeout waiting for data.")
                                 break
-                            f.write(chunk)
                     
                     conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
                 except socket.timeout:
