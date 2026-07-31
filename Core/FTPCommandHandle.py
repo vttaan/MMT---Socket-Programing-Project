@@ -273,9 +273,6 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
                 udp.close()
 
                 conn.sendall("226 Transfer complete.\r\n".encode('utf-8'))
-                                udp.close()
-
-                conn.sendall("226 Transfer complete.\r\n".encode('utf-8'))
             else:
                 conn.sendall("550 Directory not found.\r\n".encode('utf-8'))
         except Exception as e:
@@ -315,7 +312,7 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
             try:
                 os.makedirs(phys_path, exist_ok=True)
                 conn.sendall(f'257 "{part[1]}" directory created.\r\n'.encode('utf-8'))
-                except Exception as e:
+            except Exception as e:
                 conn.sendall(f"550 Cannot create directory: {e}\r\n".encode('utf-8'))
         else:
             conn.sendall("501 Syntax error\r\n".encode('utf-8'))
@@ -325,17 +322,18 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
         if len(part) > 1:
             phys_path = get_physical_path(part[1], auth_state)
             try:
-                except Exception as e:
-                conn.sendall(f"550 Cannot create directory: {e}\r\n".encode('utf-8'))
+                os.rmdir(phys_path)
+                conn.sendall("250 Directory removed.\r\n".encode('utf-8'))
+            except Exception:
+                conn.sendall("550 Directory not found or not empty.\r\n".encode('utf-8'))
         else:
             conn.sendall("501 Syntax error\r\n".encode('utf-8'))
 
-    # Command used to remove an empty directory
-    elif cmd == "RMD":
+    # Command used to delete a file
+    elif cmd == "DELE":
         if len(part) > 1:
+                
             phys_path = get_physical_path(part[1], auth_state)
-            try:
-                phys_path = get_physical_path(part[1], auth_state)
             if os.path.exists(phys_path) and os.path.isfile(phys_path):
                 if file_lock_manager.try_acquire_write(phys_path):
                     try:
