@@ -386,8 +386,21 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
                         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                         data_addr = auth_state.get('data_addr', (addr[0], UDP_PORT))
                         
-                        print(f"[SERVER Thread-{current_thread}] Sending file '{filename}' via RDT to UDP {data_addr}")
-                        success = rdt_send_file(udp, data_addr, phys_path)
+                        print(f"[SERVER Thread-{current_thread}] Sending file '{filename}' to UDP {data_addr}")
+                        with open(phys_path, 'rb') as f:
+                            while True:
+                                #check if aborts
+                                if check_abort(conn):
+                                    aborted = True
+                                    break
+                        
+                                chunk = f.read(1024)
+                                if not chunk:
+                                    break
+                                udp.sendto(chunk, data_addr)
+                                time.sleep(0.001) # Congestion control
+
+                        udp.sendto(b'__EOF__', data_addr)
                         udp.close()
 
                         if success:
@@ -417,14 +430,45 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
                     conn.sendall(f"150 Ok to send data on port {UDP_PORT}\r\n".encode('utf-8'))
                     print(f"[SERVER Thread-{current_thread}] Listening for file upload via RDT on UDP port {UDP_PORT}")
                     
-                    success = rdt_receive_file(udp, phys_path)
-                    udp.close()
-                    udp = None
-
-                    if success:
-                        conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
-                    else:
-                        conn.sendall("426 Connection closed; transfer aborted\r\n".encode('utf-8'))
+                    with open(phys_path, 'wb') as f:
+                        expected_seq = 0
+    
+                        while True:
+                            #check if aborts
+                            if check_abort(conn):
+                                aborted = True
+                                break
+                            try:
+                                packet, client_addr = udp.recvfrom(2048)
+                                
+                                # 1. Check for EOF packet (Header = 0xFFFFFFFF)
+                                if len(packet) >= 4:
+                                    seq_num = struct.unpack('!I', packet[:4])[0]
+                                    payload = packet[4:]
+                                    if seq_num == 0xFFFFFFFF and payload == b'__EOF__':
+                                        print(f"[SERVER Thread-{current_thread}] Received EOF. Upload completed.")
+                                        break
+                                    
+                                    # 2. In-order packet check
+                                    if seq_num == expected_seq:
+                                        f.write(payload)
+                                        # Send ACK back for this sequence number
+                                        ack_packet = struct.pack('!I', seq_num)
+                                        udp.sendto(ack_packet, client_addr)
+                                        expected_seq += 1
+                                    else:
+                                        # Duplicate or out-of-order packet: Re-ACK the last valid packet
+                                        if expected_seq > 0:
+                                            ack_packet = struct.pack('!I', expected_seq - 1)
+                                            udp.sendto(ack_packet, client_addr)
+                                            
+                            except socket.timeout:
+                                print(f"[SERVER Thread-{current_thread}] Socket timeout waiting for data.")
+                                break
+                    
+                    conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
+                except socket.timeout:
+                    conn.sendall("426 Connection timed out; transfer aborted\r\n".encode('utf-8'))
                 except Exception as e:
                     conn.sendall(f"451 Local error: {e}\r\n".encode('utf-8'))
                 finally:
