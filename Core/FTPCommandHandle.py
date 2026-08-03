@@ -390,6 +390,11 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
                         print(f"[SERVER Thread-{current_thread}] Sending file '{filename}' to UDP {data_addr}")
                         with open(phys_path, 'rb') as f:
                             while True:
+                                #check if aborts
+                                if check_abort(conn):
+                                    aborted = True
+                                    break
+                        
                                 chunk = f.read(1024)
                                 if not chunk:
                                     break
@@ -428,6 +433,10 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
                         expected_seq = 0
     
                         while True:
+                            #check if aborts
+                            if check_abort(conn):
+                                aborted = True
+                                break
                             try:
                                 packet, client_addr = udp.recvfrom(2048)
                                 
