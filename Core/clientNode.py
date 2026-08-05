@@ -3,10 +3,25 @@ import os
 import time
 import struct
 import select
+import hashlib
 from rdt import rdt_send_file, rdt_receive_file
 
 
 UDP_PORT = 5000
+
+def compute_local_hash(filepath):
+    # Read file in chunks and compute SHA-256 hash 
+    if not os.path.exists(filepath) or not os.path.isfile(filepath):
+        return None
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        print(f"[System] ERROR when computing hash: {e}")
+        return None
 
 def send_file_sliding_window(udp_socket, file_path, target_addr, window_size=5, timeout=1.0): 
     packets = []
@@ -242,11 +257,31 @@ class ClientNode:
                     complete_msg = s.recv(1024).decode("utf8").strip()
                     print(f"Server: {complete_msg}")
 
+                    # Verify file integrity after download
+                    if "226" in complete_msg:
+                        local_hash = compute_local_hash(filename)
+                        if local_hash:
+                            print("[System] Verifying data integrity (Download)...")
+                            # Send HASH command to server for verification
+                            s.sendall(f"HASH {part[1]}\r\n".encode("utf8"))
+                            hash_resp = s.recv(1024).decode("utf8").strip()
+                            
+                            if hash_resp.startswith("200"):
+                                server_hash = hash_resp.split(" ")[1]
+                                if local_hash == server_hash:
+                                    print(f"[+] INTEGRITY VERIFIED: Match SHA-256!\n    Hash: {local_hash}")
+                                else:
+                                    print(f"[-] INTEGRITY FAILED: Data Corrupted!\n    Client: {local_hash}\n    Server: {server_hash}")
+
             elif cmd == "STOR" and str_data.startswith("150"):
                 if len(part) > 1:
                     filename = part[1]
                     if os.path.exists(filename) and os.path.isfile(filename):
                         print(f"[System] Opening RDT UDP socket to send '{filename}'...")
+
+                        # Compute local hash for integrity verification
+                        local_hash = compute_local_hash(filename)
+
                         target_ip = server_pasv_ip if self.data_mode == "PASSIVE" else self.hostID
                         target_port = server_pasv_port if self.data_mode == "PASSIVE" else UDP_PORT
                         
@@ -267,13 +302,44 @@ class ClientNode:
                         finally:
                             if active_udp_socket:
                                 active_udp_socket.close()
+
+                        complete_msg = s.recv(1024).decode("utf8").strip()
+                        print(f"Server: {complete_msg}")
+                        
+                        # Post-transfer integrity verification
+                        if "226" in complete_msg and local_hash:
+                            print("[System] Verifying data integrity (Upload)...")
+                            # Request Server to calculate hash of the file it just received
+                            s.sendall(f"HASH {filename}\r\n".encode("utf8"))
+                            hash_resp = s.recv(1024).decode("utf8").strip()
+                            
+                            if hash_resp.startswith("200"):
+                                server_hash = hash_resp.split(" ")[1]
+                                if local_hash == server_hash:
+                                    print(f"[+] INTEGRITY VERIFIED: Match SHA-256!\n    Hash: {local_hash}")
+                                else:
+                                    print(f"[-] INTEGRITY FAILED: Data Corrupted!\n    Client: {local_hash}\n    Server: {server_hash}")
+
                     else:
                         print(f"[System] Local error: File '{filename}' not found on your machine.")
                         if active_udp_socket:
                             active_udp_socket.close()
-                
-                complete_msg = s.recv(1024).decode("utf8").strip()
-                print(f"Server: {complete_msg}")
+                        complete_msg = s.recv(1024).decode("utf8").strip()
+                        print(f"Server: {complete_msg}")
+
+                # Verify file integrity after upload
+                if "226" in complete_msg and local_hash:
+                    print("[System] Verifying data integrity (Upload)...")
+                    # Request Server to calculate hash of the file it just received
+                    s.sendall(f"HASH {filename}\r\n".encode("utf8"))
+                    hash_resp = s.recv(1024).decode("utf8").strip()
+                            
+                    if hash_resp.startswith("200"):
+                        server_hash = hash_resp.split(" ")[1]
+                        if local_hash == server_hash:
+                            print(f"[+] INTEGRITY VERIFIED: Match SHA-256!\n    Hash: {local_hash}")
+                        else:
+                            print(f"[-] INTEGRITY FAILED: Data Corrupted!\n    Client: {local_hash}\n    Server: {server_hash}")
 
             elif cmd == "LIST" and str_data.startswith("150"):
                 try:
