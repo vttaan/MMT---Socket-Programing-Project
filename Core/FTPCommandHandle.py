@@ -9,18 +9,17 @@ from datetime import datetime
 import struct
 from rdt import rdt_send_file, rdt_receive_file, UDP_PORT
 
-def check_abort(conn):
+def check_abort(conn, auth_state=None):
     try:
-        #select.selct -> 4 parameters(read,write,error,timeout)
         rlist, _, _ = select.select([conn], [], [], 0)
-        #check if there is file transfer
         if rlist:
             data = conn.recv(1024)
             if not data:
-                #abort transfer
                 return True
             msg = data.decode('utf-8', errors='ignore').strip().upper()
             if "ABOR" in msg:
+                if auth_state is not None:
+                    auth_state['was_aborted'] = True
                 return True
     except Exception:
         pass
@@ -90,6 +89,9 @@ def get_physical_path(virtual_path, auth_state):
     
     # Normalize path separators
     virtual_path = virtual_path.replace('\\', '/')
+
+
+
     
     if virtual_path.startswith('/'):
         combined = os.path.join(SERVER_STORAGE, virtual_path.lstrip('/'))
@@ -173,6 +175,7 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
                     ip = ".".join(params[:4])
                     port = (int(params[4]) << 8) + int(params[5])
                     auth_state['data_addr'] = (ip, port)
+                    auth_state.pop('pasv_port', None)
                     conn.sendall("200 PORT command successful\r\n".encode('utf-8'))
                 else:
                     conn.sendall("501 Illegal PORT command\r\n".encode('utf-8'))
@@ -189,6 +192,9 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
             temp_udp.bind(('0.0.0.0', 0))
             allocated_port = temp_udp.getsockname()[1]
             temp_udp.close()
+            
+            auth_state['pasv_port'] = allocated_port
+            auth_state.pop('data_addr', None)
             
             ip_formatted = addr[0].replace('.', ',')
             p1 = allocated_port // 256
@@ -244,14 +250,25 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
                 if not list_str:
                     list_str = "Directory is empty.\r\n"
 
-                # Send data via UDP to configured data_addr
-                data_addr = auth_state.get('data_addr', (addr[0], UDP_PORT))
+                # Send data via UDP to configured data_addr or pasv_port
+                pasv_port = auth_state.pop('pasv_port', None)
                 udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                
-                print(f"[SERVER Thread-{current_thread}] Sending directory list to UDP address {data_addr}")
-                udp.sendto(list_str.encode('utf-8'), data_addr)
+                if pasv_port:
+                    udp.bind(('0.0.0.0', pasv_port))
+                    udp.settimeout(5.0)
+                    try:
+                        _, target_addr = udp.recvfrom(1024)
+                    except socket.timeout:
+                        conn.sendall("425 Data connection timed out.\r\n".encode('utf-8'))
+                        udp.close()
+                        return False
+                else:
+                    target_addr = auth_state.get('data_addr', (addr[0], UDP_PORT))
+
+                print(f"[SERVER Thread-{current_thread}] Sending directory list to UDP address {target_addr}")
+                udp.sendto(list_str.encode('utf-8'), target_addr)
                 time.sleep(0.001) # Avoid congestion
-                udp.sendto(b"__EOF__", data_addr)
+                udp.sendto(b"__EOF__", target_addr)
                 udp.close()
 
                 conn.sendall("226 Transfer complete.\r\n".encode('utf-8'))
@@ -382,31 +399,33 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
             else:
                 if file_lock_manager.try_acquire_read(phys_path):
                     try:
-                        conn.sendall("150 File status okay, opening data connection\r\n".encode('utf-8'))
+                        pasv_port = auth_state.pop('pasv_port', None)
                         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                        data_addr = auth_state.get('data_addr', (addr[0], UDP_PORT))
-                        
-                        print(f"[SERVER Thread-{current_thread}] Sending file '{filename}' to UDP {data_addr}")
-                        with open(phys_path, 'rb') as f:
-                            while True:
-                                #check if aborts
-                                if check_abort(conn):
-                                    aborted = True
-                                    break
-                        
-                                chunk = f.read(1024)
-                                if not chunk:
-                                    break
-                                udp.sendto(chunk, data_addr)
-                                time.sleep(0.001) # Congestion control
+                        if pasv_port:
+                            udp.bind(('0.0.0.0', pasv_port))
+                            conn.sendall("150 File status okay, opening data connection\r\n".encode('utf-8'))
+                            udp.settimeout(5.0)
+                            try:
+                                _, target_addr = udp.recvfrom(1024)
+                            except socket.timeout:
+                                conn.sendall("425 Data connection timed out waiting for client\r\n".encode('utf-8'))
+                                udp.close()
+                                file_lock_manager.release_read(phys_path)
+                                return False
+                        else:
+                            conn.sendall("150 File status okay, opening data connection\r\n".encode('utf-8'))
+                            target_addr = auth_state.get('data_addr', (addr[0], UDP_PORT))
 
-                        udp.sendto(b'__EOF__', data_addr)
+                        print(f"[SERVER Thread-{current_thread}] Sending file '{filename}' via RDT to UDP {target_addr}")
+                        success = rdt_send_file(udp, target_addr, phys_path, cancel_check=lambda: check_abort(conn, auth_state))
                         udp.close()
 
                         if success:
                             conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
                         else:
                             conn.sendall("426 Connection closed; transfer aborted\r\n".encode('utf-8'))
+                            if auth_state.pop('was_aborted', False):
+                                conn.sendall("226 ABOR command successful.\r\n".encode('utf-8'))
                     except Exception as e:
                         conn.sendall(f"451 Local error during transfer: {e}\r\n".encode('utf-8'))
                     finally:
@@ -416,124 +435,44 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
         else:
             conn.sendall("501 Syntax error\r\n".encode('utf-8'))
 
-    # Command used to upload file from client to server
-    elif cmd == "STOR":
-        if len(part) > 1:
+    # Commands used to upload file from client to server (STOR, STOU, APPE)
+    elif cmd in ["STOR", "STOU", "APPE"]:
+        if cmd == "STOU":
+            filename = f"file_{int(time.time())}.dat"
+        elif len(part) > 1:
             filename = part[1]
-            phys_path = get_physical_path(filename, auth_state)
-            if file_lock_manager.try_acquire_write(phys_path):
-                udp = None
-                try:
-                    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    udp.bind(('0.0.0.0', UDP_PORT))
-                    
-                    conn.sendall(f"150 Ok to send data on port {UDP_PORT}\r\n".encode('utf-8'))
-                    print(f"[SERVER Thread-{current_thread}] Listening for file upload via RDT on UDP port {UDP_PORT}")
-                    
-                    with open(phys_path, 'wb') as f:
-                        expected_seq = 0
-    
-                        while True:
-                            #check if aborts
-                            if check_abort(conn):
-                                aborted = True
-                                break
-                            try:
-                                packet, client_addr = udp.recvfrom(2048)
-                                
-                                # 1. Check for EOF packet (Header = 0xFFFFFFFF)
-                                if len(packet) >= 4:
-                                    seq_num = struct.unpack('!I', packet[:4])[0]
-                                    payload = packet[4:]
-                                    if seq_num == 0xFFFFFFFF and payload == b'__EOF__':
-                                        print(f"[SERVER Thread-{current_thread}] Received EOF. Upload completed.")
-                                        break
-                                    
-                                    # 2. In-order packet check
-                                    if seq_num == expected_seq:
-                                        f.write(payload)
-                                        # Send ACK back for this sequence number
-                                        ack_packet = struct.pack('!I', seq_num)
-                                        udp.sendto(ack_packet, client_addr)
-                                        expected_seq += 1
-                                    else:
-                                        # Duplicate or out-of-order packet: Re-ACK the last valid packet
-                                        if expected_seq > 0:
-                                            ack_packet = struct.pack('!I', expected_seq - 1)
-                                            udp.sendto(ack_packet, client_addr)
-                                            
-                            except socket.timeout:
-                                print(f"[SERVER Thread-{current_thread}] Socket timeout waiting for data.")
-                                break
-                    
-                    conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
-                except socket.timeout:
-                    conn.sendall("426 Connection timed out; transfer aborted\r\n".encode('utf-8'))
-                except Exception as e:
-                    conn.sendall(f"451 Local error: {e}\r\n".encode('utf-8'))
-                finally:
-                    if udp:
-                        udp.close()
-                    file_lock_manager.release_write(phys_path)
-            else:
-                conn.sendall("450 File is busy (locked by another session).\r\n".encode('utf-8'))
         else:
-            conn.sendall("500 Syntax error\r\n".encode('utf-8'))
-            # Command used to upload a file with a guaranteed unique filename
-    elif cmd == "STOU":
-        unique_filename = f"file_{int(time.time())}.dat"
-        conn.sendall(f"150 FILE: {unique_filename}\r\n".encode('utf-8'))
-        
-        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp.bind(('0.0.0.0', UDP_PORT))
-        #settimeour
-        udp.settimeout(0.5)
+            conn.sendall("501 Syntax error\r\n".encode('utf-8'))
+            return False
 
-        aborted = False
-        with open(unique_filename, 'wb') as f:
-            while True:
-                #check if abort
-                if check_abort(conn):
-                    aborted = True
-                    break
-                try:
-                    chunk, _ = udp.recvfrom(2048)
-                    if chunk == b'__EOF__':
-                        break
-                    f.write(chunk)
-                    #if timeout
-                except socket.timeout:
-                    continue
-                except Exception:
-                    break
-        udp.close()
+        phys_path = get_physical_path(filename, auth_state)
+        write_mode = "ab" if cmd == "APPE" else "wb"
 
-        if aborted:
-            conn.sendall("426 Data connection closed; transfer aborted.\r\n".encode('utf-8'))
-            conn.sendall("226 ABOR command successful.\r\n".encode('utf-8'))
-        else:
-            conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
-        phys_path = get_physical_path(unique_filename, auth_state)
         if file_lock_manager.try_acquire_write(phys_path):
             udp = None
             try:
                 udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                udp.bind(('0.0.0.0', 0))
-                server_port = udp.getsockname()[1]
-                udp.settimeout(10.0)
-                
-                conn.sendall(f"150 FILE: {unique_filename} on port {server_port}\r\n".encode('utf-8'))
-                
-                with open(phys_path, 'wb') as f:
-                    while True:
-                        chunk, _ = udp.recvfrom(2048)
-                        if chunk == b'__EOF__':
-                            break
-                        f.write(chunk)
-                
-                conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
-            except socket.timeout:
-                conn.sendall("426 Connection timed out; transfer aborted\r\n".encode('utf-8'))
+                pasv_port = auth_state.pop('pasv_port', None)
+                bind_port = pasv_port if pasv_port else 0
+                udp.bind(('0.0.0.0', bind_port))
+                actual_port = udp.getsockname()[1]
+
+                if cmd == "STOU":
+                    conn.sendall(f"150 FILE: {filename} on port {actual_port}\r\n".encode('utf-8'))
+                else:
+                    conn.sendall(f"150 Ok to send data on port {actual_port}\r\n".encode('utf-8'))
+
+                print(f"[SERVER Thread-{current_thread}] Listening for file upload via RDT on UDP port {actual_port}")
+                success = rdt_receive_file(udp, phys_path, mode=write_mode, cancel_check=lambda: check_abort(conn, auth_state))
+                udp.close()
+                udp = None
+
+                if success:
+                    conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
+                else:
+                    conn.sendall("426 Connection closed; transfer aborted\r\n".encode('utf-8'))
+                    if auth_state.pop('was_aborted', False):
+                        conn.sendall("226 ABOR command successful.\r\n".encode('utf-8'))
             except Exception as e:
                 conn.sendall(f"451 Local error: {e}\r\n".encode('utf-8'))
             finally:
@@ -542,69 +481,6 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
                 file_lock_manager.release_write(phys_path)
         else:
             conn.sendall("450 File is busy (locked by another session).\r\n".encode('utf-8'))
-
-    # Command used to append uploaded data to an existing file or create it
-    elif cmd == "APPE":
-        if len(part) > 1:
-            filename = part[1]
-            conn.sendall("150 Ok to send data\r\n".encode('utf-8'))
-            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp.bind(('0.0.0.0', UDP_PORT))
-            udp.settimeout(0.5)
-
-            aborted = False
-            with open(filename, 'ab') as f:
-                while True:
-                    if check_abort(conn):
-                        aborted = True
-                        break
-                    try:
-                        chunk, _ = udp.recvfrom(2048)
-                        if chunk == b'__EOF__':
-                            break
-                        f.write(chunk)
-                    except socket.timeout:
-                        continue
-                    except Exception:
-                        break
-            udp.close()
-
-            if aborted:
-                conn.sendall("426 Data connection closed; transfer aborted.\r\n".encode('utf-8'))
-                conn.sendall("226 ABOR command successful.\r\n".encode('utf-8'))
-            else:
-                conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
-            phys_path = get_physical_path(filename, auth_state)
-            if file_lock_manager.try_acquire_write(phys_path):
-                udp = None
-                try:
-                    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    udp.bind(('0.0.0.0', 0))
-                    server_port = udp.getsockname()[1]
-                    udp.settimeout(10.0)
-                    
-                    conn.sendall(f"150 Ok to send data on port {server_port}\r\n".encode('utf-8'))
-                    
-                    with open(phys_path, 'ab') as f:
-                        while True:
-                            chunk, _ = udp.recvfrom(2048)
-                            if chunk == b'__EOF__':
-                                break
-                            f.write(chunk)
-                    
-                    conn.sendall("226 Transfer complete\r\n".encode('utf-8'))
-                except socket.timeout:
-                    conn.sendall("426 Connection timed out; transfer aborted\r\n".encode('utf-8'))
-                except Exception as e:
-                    conn.sendall(f"451 Local error: {e}\r\n".encode('utf-8'))
-                finally:
-                    if udp:
-                        udp.close()
-                    file_lock_manager.release_write(phys_path)
-            else:
-                conn.sendall("450 File is busy (locked by another session).\r\n".encode('utf-8'))
-        else:
-            conn.sendall("500 Syntax error\r\n".encode('utf-8'))
     # Command used to calculate cryptographic hash (SHA-256) for file verification
     elif cmd == "HASH":
         if len(part) > 1:
