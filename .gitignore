@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Large test and transfer files
+downloaded_*
+*.dat
+test_copy_output.txt
+a.txt

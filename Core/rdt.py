@@ -28,8 +28,8 @@ def parse_packet(raw_data: bytes):
     return seq_num, ack_num, flags, payload
 
 
-#Rdt use file(use for client RETR & server STOR)
-def rdt_send_file(udp_socket: socket.socket, target_addr: tuple, filepath: str):
+# Rdt use file (use for client RETR & server STOR)
+def rdt_send_file(udp_socket: socket.socket, target_addr: tuple, filepath: str, cancel_check=None):
     if not os.path.exists(filepath) or not os.path.isfile(filepath):
         print(f"[RDT Sender] Error: File '{filepath}' does not exist.")
         return False
@@ -39,6 +39,10 @@ def rdt_send_file(udp_socket: socket.socket, target_addr: tuple, filepath: str):
 
     with open(filepath, "rb") as f:
         while True:
+            if cancel_check and cancel_check():
+                print("[RDT Sender] Transfer aborted by user (ABOR).")
+                return False
+
             payload = f.read(PACKET_SIZE)
             is_eof = len(payload) == 0
 
@@ -52,6 +56,10 @@ def rdt_send_file(udp_socket: socket.socket, target_addr: tuple, filepath: str):
             max_retries = 10
             
             while not ack_received and retries < max_retries:
+                if cancel_check and cancel_check():
+                    print("[RDT Sender] Transfer aborted by user (ABOR).")
+                    return False
+
                 try:
                     # 1. Send Packet
                     udp_socket.sendto(packet, target_addr)
@@ -70,6 +78,9 @@ def rdt_send_file(udp_socket: socket.socket, target_addr: tuple, filepath: str):
                 except socket.timeout:
                     retries += 1
                     print(f"[RDT Sender] Timeout! Resending seq={seq_num} (Attempt {retries}/{max_retries})...")
+                except OSError:
+                    print(f"[RDT Sender] Socket closed / transfer aborted.")
+                    break
                 except Exception as e:
                     print(f"[RDT Sender] Socket error: {e}")
                     break
@@ -85,13 +96,17 @@ def rdt_send_file(udp_socket: socket.socket, target_addr: tuple, filepath: str):
     return True
 
 
-#Rdt use file(use for server STOR & client RETR)
-def rdt_receive_file(udp_socket: socket.socket, save_filepath: str):
+# Rdt use file (use for server STOR/APPE & client RETR)
+def rdt_receive_file(udp_socket: socket.socket, save_filepath: str, mode: str = "wb", cancel_check=None):
     expected_seq = 0
     udp_socket.settimeout(5.0)  
 
-    with open(save_filepath, "wb") as f:
+    with open(save_filepath, mode) as f:
         while True:
+            if cancel_check and cancel_check():
+                print("[RDT Receiver] Transfer aborted by user (ABOR).")
+                return False
+
             try:
                 raw_data, sender_addr = udp_socket.recvfrom(HEADER_SIZE + PACKET_SIZE)
                 seq_num, ack_num, flags, payload = parse_packet(raw_data)
@@ -113,6 +128,9 @@ def rdt_receive_file(udp_socket: socket.socket, save_filepath: str):
 
                     # If FIN flag is present, transfer is finished
                     if flags & FLAG_FIN:
+                        # Send redundant FIN ACKs to ensure sender receives it
+                        for _ in range(2):
+                            udp_socket.sendto(ack_packet, sender_addr)
                         print(f"[RDT Receiver] FIN received. File successfully saved to '{save_filepath}'.")
                         break
 
@@ -124,6 +142,9 @@ def rdt_receive_file(udp_socket: socket.socket, save_filepath: str):
 
             except socket.timeout:
                 print(f"[RDT Receiver] Transfer timed out waiting for data.")
+                return False
+            except OSError:
+                print(f"[RDT Receiver] Transfer aborted (socket closed).")
                 return False
             except Exception as e:
                 print(f"[RDT Receiver] Error receiving file: {e}")

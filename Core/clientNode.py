@@ -4,6 +4,7 @@ import time
 import struct
 import select
 import hashlib
+import threading
 from rdt import rdt_send_file, rdt_receive_file
 
 
@@ -83,6 +84,9 @@ class ClientNode:
         self.control_socket = None
         self.username = None
         self.password = None
+        self.transfer_thread = None
+        self.active_transfer_socket = None
+        self.transfer_in_progress = False
 
     def connect(self):
         try:
@@ -141,10 +145,30 @@ class ClientNode:
     def _interactive_session(self):
         s = self.control_socket
         while True:
+            # Drain any status messages sitting on control socket before prompting
+            try:
+                rlist, _, _ = select.select([s], [], [], 0.05)
+                if rlist:
+                    data = s.recv(1024)
+                    if data:
+                        print(f"Server: {data.decode('utf-8', errors='ignore').strip()}")
+            except Exception:
+                pass
+
             msg = input(f"FTP Client ({self.data_mode})> ").strip()
             if not msg:
                 continue
-                
+
+            # Drain any status messages that arrived while user was typing input
+            try:
+                rlist, _, _ = select.select([s], [], [], 0.05)
+                if rlist:
+                    data = s.recv(1024)
+                    if data:
+                        print(f"Server: {data.decode('utf-8', errors='ignore').strip()}")
+            except Exception:
+                pass
+
             # Local client toggle for data mode
             if msg.upper() == "PASV_MODE":
                 self.data_mode = "PASSIVE"
@@ -165,12 +189,51 @@ class ClientNode:
                     print(f"Server: {data.decode('utf8').strip()}")
                 break
 
+            if cmd == "ABOR":
+                if self.transfer_in_progress:
+                    print("[System] Aborting active file transfer...")
+                    if self.active_transfer_socket:
+                        try:
+                            self.active_transfer_socket.close()
+                        except Exception:
+                            pass
+                
+                s.sendall(b"ABOR\r\n")
+                self.transfer_in_progress = False
+
+                # Read response(s) from server for ABOR
+                time.sleep(0.1)
+                try:
+                    s.settimeout(1.0)
+                    while True:
+                        rlist, _, _ = select.select([s], [], [], 0.2)
+                        if not rlist:
+                            break
+                        resp_data = s.recv(1024)
+                        if not resp_data:
+                            break
+                        print(f"Server: {resp_data.decode('utf-8', errors='ignore').strip()}")
+                except Exception:
+                    pass
+                finally:
+                    s.settimeout(None)
+                continue
+
+            if cmd in ["STOR", "APPE"]:
+                if len(part) <= 1:
+                    print("[System] Syntax error: Please specify a file.")
+                    continue
+                filename = part[1]
+                if not os.path.exists(filename) or not os.path.isfile(filename):
+                    print(f"[System] Local error: File '{filename}' not found on your machine.")
+                    continue
+
             active_udp_socket = None
             server_pasv_ip = None
             server_pasv_port = None
 
             # Setup Data Connection BEFORE sending data transfer commands
-            if cmd in ["RETR", "LIST", "STOR"]:
+            if cmd in ["RETR", "LIST", "STOR", "STOU", "APPE"]:
                 try:
                     if self.data_mode == "ACTIVE":
                         active_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -232,118 +295,111 @@ class ClientNode:
             print(f"Server: {str_data}")
             
             # Clean up if server rejects transfer
-            if cmd in ["RETR", "LIST", "STOR"] and not str_data.startswith("150"):
+            if cmd in ["RETR", "LIST", "STOR", "STOU", "APPE"] and not str_data.startswith("150"):
                 if active_udp_socket:
                     active_udp_socket.close()
                 continue
 
             # --- Data Transfer Handlers ---
 
-            if cmd == "RETR" and str_data.startswith("150"):
-                try:
-                    filename = "download_file.dat" if len(part) == 1 else "downloaded_" + part[1]
-                    
-                    if active_udp_socket is None:
-                        active_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                        active_udp_socket.bind(('0.0.0.0', UDP_PORT))
+            if cmd in ["RETR", "STOR", "STOU", "APPE"] and str_data.startswith("150"):
+                self.active_transfer_socket = active_udp_socket
+                self.transfer_in_progress = True
 
-                    print(f"[System] Opening RDT UDP port to receive '{filename}'...")
-                    rdt_receive_file(active_udp_socket, filename)
-                except Exception as e:
-                    print(f"[System] UDP Error: {e}")
-                finally:
-                    if active_udp_socket:
-                        active_udp_socket.close()
-                    complete_msg = s.recv(1024).decode("utf8").strip()
-                    print(f"Server: {complete_msg}")
+                def bg_transfer_worker(command_type, parts, active_sock, pasv_ip, pasv_port, initial_resp):
+                    try:
+                        if command_type == "RETR":
+                            filename = "download_file.dat" if len(parts) == 1 else "downloaded_" + parts[1]
+                            if active_sock is None:
+                                active_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                                active_sock.bind(('0.0.0.0', 0))
 
-                    # Verify file integrity after download
-                    if "226" in complete_msg:
-                        local_hash = compute_local_hash(filename)
-                        if local_hash:
-                            print("[System] Verifying data integrity (Download)...")
-                            # Send HASH command to server for verification
-                            s.sendall(f"HASH {part[1]}\r\n".encode("utf8"))
-                            hash_resp = s.recv(1024).decode("utf8").strip()
+                            if self.data_mode == "PASSIVE" and pasv_ip and pasv_port:
+                                active_sock.sendto(b"READY", (pasv_ip, pasv_port))
+
+                            print(f"\n[System] Opening RDT UDP socket to receive '{filename}'...")
+                            success = rdt_receive_file(active_sock, filename, cancel_check=lambda: not self.transfer_in_progress)
                             
-                            if hash_resp.startswith("200"):
-                                server_hash = hash_resp.split(" ")[1]
-                                if local_hash == server_hash:
-                                    print(f"[+] INTEGRITY VERIFIED: Match SHA-256!\n    Hash: {local_hash}")
-                                else:
-                                    print(f"[-] INTEGRITY FAILED: Data Corrupted!\n    Client: {local_hash}\n    Server: {server_hash}")
-
-            elif cmd == "STOR" and str_data.startswith("150"):
-                if len(part) > 1:
-                    filename = part[1]
-                    if os.path.exists(filename) and os.path.isfile(filename):
-                        print(f"[System] Opening RDT UDP socket to send '{filename}'...")
-
-                        # Compute local hash for integrity verification
-                        local_hash = compute_local_hash(filename)
-
-                        target_ip = server_pasv_ip if self.data_mode == "PASSIVE" else self.hostID
-                        target_port = server_pasv_port if self.data_mode == "PASSIVE" else UDP_PORT
-                        
-                        if self.data_mode == "ACTIVE" and "port" in str_data:
-                            try:
-                                target_port = int(str_data.split("port")[-1].strip())
-                            except ValueError:
-                                pass
+                            # Read control response from server after transfer
+                            if success:
+                                complete_msg = s.recv(1024).decode("utf8").strip()
+                                print(f"\nServer: {complete_msg}")
                                 
-                        if active_udp_socket is None:
-                            active_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-                        try:
-                            rdt_send_file(active_udp_socket, (target_ip, target_port), filename)
-                            print(f"[System] File sent via RDT UDP to {target_ip}:{target_port}!")
-                        except Exception as e:
-                            print(f"[System] UDP Error: {e}")
-                        finally:
-                            if active_udp_socket:
-                                active_udp_socket.close()
-
-                        complete_msg = s.recv(1024).decode("utf8").strip()
-                        print(f"Server: {complete_msg}")
-                        
-                        # Post-transfer integrity verification
-                        if "226" in complete_msg and local_hash:
-                            print("[System] Verifying data integrity (Upload)...")
-                            # Request Server to calculate hash of the file it just received
-                            s.sendall(f"HASH {filename}\r\n".encode("utf8"))
-                            hash_resp = s.recv(1024).decode("utf8").strip()
+                                # Verify file integrity after download
+                                if "226" in complete_msg:
+                                    local_hash = compute_local_hash(filename)
+                                    if local_hash:
+                                        remote_filename = parts[1] if len(parts) > 1 else ""
+                                        if remote_filename:
+                                            print("[System] Verifying data integrity (Download)...")
+                                            s.sendall(f"HASH {remote_filename}\r\n".encode("utf8"))
+                                            hash_resp = s.recv(1024).decode("utf8").strip()
+                                            
+                                            if hash_resp.startswith("200"):
+                                                server_hash = hash_resp.split(" ")[1]
+                                                if local_hash == server_hash:
+                                                    print(f"[+] INTEGRITY VERIFIED: Match SHA-256!\n    Hash: {local_hash}")
+                                                else:
+                                                    print(f"[-] INTEGRITY FAILED: Data Corrupted!\n    Client: {local_hash}\n    Server: {server_hash}")
                             
-                            if hash_resp.startswith("200"):
-                                server_hash = hash_resp.split(" ")[1]
-                                if local_hash == server_hash:
-                                    print(f"[+] INTEGRITY VERIFIED: Match SHA-256!\n    Hash: {local_hash}")
-                                else:
-                                    print(f"[-] INTEGRITY FAILED: Data Corrupted!\n    Client: {local_hash}\n    Server: {server_hash}")
-
-                    else:
-                        print(f"[System] Local error: File '{filename}' not found on your machine.")
-                        if active_udp_socket:
-                            active_udp_socket.close()
-                        complete_msg = s.recv(1024).decode("utf8").strip()
-                        print(f"Server: {complete_msg}")
-
-                # Verify file integrity after upload
-                if "226" in complete_msg and local_hash:
-                    print("[System] Verifying data integrity (Upload)...")
-                    # Request Server to calculate hash of the file it just received
-                    s.sendall(f"HASH {filename}\r\n".encode("utf8"))
-                    hash_resp = s.recv(1024).decode("utf8").strip()
+                        elif command_type in ["STOR", "STOU", "APPE"]:
+                            filename = parts[1] if len(parts) > 1 else "upload.dat"
+                            target_ip = pasv_ip if (self.data_mode == "PASSIVE" and pasv_ip) else self.hostID
+                            target_port = pasv_port if (self.data_mode == "PASSIVE" and pasv_port) else UDP_PORT
                             
-                    if hash_resp.startswith("200"):
-                        server_hash = hash_resp.split(" ")[1]
-                        if local_hash == server_hash:
-                            print(f"[+] INTEGRITY VERIFIED: Match SHA-256!\n    Hash: {local_hash}")
-                        else:
-                            print(f"[-] INTEGRITY FAILED: Data Corrupted!\n    Client: {local_hash}\n    Server: {server_hash}")
+                            if "port" in initial_resp.lower():
+                                try:
+                                    target_port = int(initial_resp.lower().split("port")[-1].strip().split()[0])
+                                except (ValueError, IndexError):
+                                    pass
+                                    
+                            if active_sock is None:
+                                active_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+                            print(f"\n[System] Opening RDT UDP socket to send '{filename}' to {target_ip}:{target_port}...")
+                            local_hash = compute_local_hash(filename)
+                            
+                            success = rdt_send_file(active_sock, (target_ip, target_port), filename, cancel_check=lambda: not self.transfer_in_progress)
+                            if success:
+                                print(f"\n[System] File '{filename}' sent via RDT UDP to {target_ip}:{target_port}!")
+                                complete_msg = s.recv(1024).decode("utf8").strip()
+                                print(f"\nServer: {complete_msg}")
+                                
+                                # Verify file integrity after upload
+                                if "226" in complete_msg and local_hash:
+                                    print("[System] Verifying data integrity (Upload)...")
+                                    # Request Server to calculate hash of the file it just received
+                                    s.sendall(f"HASH {filename}\r\n".encode("utf8"))
+                                    hash_resp = s.recv(1024).decode("utf8").strip()
+                                    
+                                    if hash_resp.startswith("200"):
+                                        server_hash = hash_resp.split(" ")[1]
+                                        if local_hash == server_hash:
+                                            print(f"[+] INTEGRITY VERIFIED: Match SHA-256!\n    Hash: {local_hash}")
+                                        else:
+                                            print(f"[-] INTEGRITY FAILED: Data Corrupted!\n    Client: {local_hash}\n    Server: {server_hash}")
+                    except Exception as e:
+                        print(f"\n[System] UDP Transfer Error / Interrupted: {e}")
+                    finally:
+                        if active_sock:
+                            try:
+                                active_sock.close()
+                            except Exception:
+                                pass
+                        self.transfer_in_progress = False
+
+                self.transfer_thread = threading.Thread(
+                    target=bg_transfer_worker,
+                    args=(cmd, part, active_udp_socket, server_pasv_ip, server_pasv_port, str_data),
+                    daemon=True
+                )
+                self.transfer_thread.start()
+                print("[System] Transfer started in background thread. Type 'ABOR' at any time to cancel.")
+                continue
 
             elif cmd == "LIST" and str_data.startswith("150"):
                 try:
-                    if self.data_mode == "PASSIVE":
+                    if self.data_mode == "PASSIVE" and server_pasv_ip and server_pasv_port:
                         active_udp_socket.sendto(b"READY", (server_pasv_ip, server_pasv_port))
                         
                     print("\n--- DIRECTORY LISTING ---")
