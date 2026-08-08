@@ -1,25 +1,9 @@
-Đây là phần basic của đồ án, những điểm chính là:
+Để chạy thử chương trình:
+ - Tạo terminal chạy file serverNode.py khởi tạo username & password
+ - Tạo terminal mới chạy file clientNode.py, nhập ip, port và dùng các command USER và PASS để xác thực kết nối với server
+ - Dùng lệnh ACTV_MODE và PASV_MODE với client để chuyển đổi mode active/passive
+ - Các command còn lại dùng như trong danh sách FTP Command
 
--Xác thực thông qua log in (user và password)
-
--Gửi file (server)
-
--Tải file (clients)
-
-Những cú pháp có thể thắc mắc:
-"\r\n" ý nghĩa là giống phím "Enter" trong máy tính, báo hiệu là kết thúc câu, nếu không có thì server bị đứng
-
-Ưu điểm khi làm UDP với TCP:
--Khi gửi file có dung lượng thấp thì nhanh hơn so với TCP và sẽ có mất mát ít hơn
-
-
-Phần chuyển đổi active/passive:
-
-- Tạo 1 class chung cho node với các chức năng (Node.py):
-    + Chuyển đổi protocol TCP/UDP
-    + Chuyển đổi mode active(client) và passive(server)
-- Gọi class Node dưới 2 file serverNode và clientNode để chạy 
-- Các file đang dùng: Node.py, FTPCommandHandle.py, serverNode.py, clientNode.py
-- Để chạy node và giao tiếp cơ bản:
-    + Chạy serverNode.py, tạo userName và password, chạy clientNode.py và kết nối tới server
-- Để demo tính năng xử lý multi thread: chạy file MultiThreadDemo.py
+Ngắt chương trình:
+ - Dùng lệnh QUIT ở client để ngắt kết nối với server
+ - Dùng Ctrl C (hoặc các tổ hợp phím) để ngắt chương trình và đóng server
