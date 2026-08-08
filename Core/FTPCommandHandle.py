@@ -89,9 +89,6 @@ def get_physical_path(virtual_path, auth_state):
     
     # Normalize path separators
     virtual_path = virtual_path.replace('\\', '/')
-
-
-
     
     if virtual_path.startswith('/'):
         combined = os.path.join(SERVER_STORAGE, virtual_path.lstrip('/'))
@@ -100,14 +97,14 @@ def get_physical_path(virtual_path, auth_state):
         
     resolved = os.path.abspath(combined)
     
-    # Sandbox check: prevent directory traversal
-    if not resolved.startswith(SERVER_STORAGE):
+    # Sandbox check: prevent directory traversal (case-insensitive check for Windows)
+    if not os.path.normcase(resolved).startswith(os.path.normcase(SERVER_STORAGE)):
         return SERVER_STORAGE
     return resolved
 
 def get_virtual_path(physical_path):
     resolved_phys = os.path.abspath(physical_path)
-    if not resolved_phys.startswith(SERVER_STORAGE):
+    if not os.path.normcase(resolved_phys).startswith(os.path.normcase(SERVER_STORAGE)):
         return '/'
     rel = os.path.relpath(resolved_phys, SERVER_STORAGE)
     if rel == '.' or rel == '':
@@ -203,9 +200,8 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
         except Exception as e:
             conn.sendall(f"425 Cannot open passive data connection: {e}\r\n".encode('utf-8'))
 
-    # Command used to display current working directory
     elif cmd == "PWD":
-        current_path = auth_state.setdefault('cwd', '/')
+        current_path = get_physical_path("", auth_state)
         conn.sendall(f'257 "{current_path}" is current directory.\r\n'.encode('utf-8'))
 
     # Command used to change directory
@@ -215,7 +211,7 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
             phys_path = get_physical_path(requested, auth_state)
             if os.path.exists(phys_path) and os.path.isdir(phys_path):
                 auth_state['cwd'] = get_virtual_path(phys_path)
-                conn.sendall(f'250 Directory changed to "{auth_state["cwd"]}"\r\n'.encode('utf-8'))
+                conn.sendall(f'250 Directory changed to "{phys_path}"\r\n'.encode('utf-8'))
             else:
                 conn.sendall("550 Directory not found or access denied.\r\n".encode('utf-8'))
         else:
@@ -226,7 +222,7 @@ def handle_ftp_command(cmd, part, conn, addr, auth_state, expected_user, expecte
         phys_path = get_physical_path("..", auth_state)
         if os.path.exists(phys_path) and os.path.isdir(phys_path):
             auth_state['cwd'] = get_virtual_path(phys_path)
-            conn.sendall(f'250 Directory changed to "{auth_state["cwd"]}"\r\n'.encode('utf-8'))
+            conn.sendall(f'250 Directory changed to "{phys_path}"\r\n'.encode('utf-8'))
         else:
             conn.sendall("550 Failed to change directory.\r\n".encode('utf-8'))
 
